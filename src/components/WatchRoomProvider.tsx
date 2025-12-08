@@ -109,43 +109,47 @@ export function WatchRoomProvider({ children }: WatchRoomProviderProps) {
   // 加载配置
   useEffect(() => {
     const loadConfig = async () => {
-      // 默认配置：启用内部服务器
-      const defaultConfig: WatchRoomConfig = {
-        enabled: true,
-        serverType: 'internal',
-      };
-
       try {
-        const response = await fetch('/api/admin/config');
+        // 使用公共 API 获取观影室配置（不需要管理员权限）
+        const response = await fetch('/api/server-config');
         if (response.ok) {
           const data = await response.json();
+          // API 返回格式: { SiteName, StorageType, Version, WatchRoom }
           const watchRoomConfig: WatchRoomConfig = {
-            enabled: data.watchRoom?.enabled ?? true,
-            serverType: data.watchRoom?.serverType ?? 'internal',
-            externalServerUrl: data.watchRoom?.externalServerUrl,
-            externalServerAuth: data.watchRoom?.externalServerAuth,
+            enabled: data.WatchRoom?.enabled ?? false, // 默认不启用
+            serverType: data.WatchRoom?.serverType ?? 'internal',
+            externalServerUrl: data.WatchRoom?.externalServerUrl,
+            externalServerAuth: data.WatchRoom?.externalServerAuth,
           };
           setConfig(watchRoomConfig);
           setIsEnabled(watchRoomConfig.enabled);
 
-          // 如果启用了观影室，自动连接
+          // 只在启用了观影室时才连接
           if (watchRoomConfig.enabled) {
             console.log('[WatchRoom] Connecting with config:', watchRoomConfig);
             await watchRoom.connect(watchRoomConfig);
+          } else {
+            console.log('[WatchRoom] Watch room is disabled, skipping connection');
           }
         } else {
-          throw new Error('Failed to load config');
+          console.error('[WatchRoom] Failed to load config:', response.status);
+          // 加载配置失败时，不连接，保持禁用状态
+          const defaultConfig: WatchRoomConfig = {
+            enabled: false,
+            serverType: 'internal',
+          };
+          setConfig(defaultConfig);
+          setIsEnabled(false);
         }
       } catch (error) {
-        console.log('[WatchRoom] Using default config (internal server enabled)');
+        console.error('[WatchRoom] Error loading config:', error);
+        // 加载配置失败时，不连接，保持禁用状态
+        const defaultConfig: WatchRoomConfig = {
+          enabled: false,
+          serverType: 'internal',
+        };
         setConfig(defaultConfig);
-        setIsEnabled(true);
-
-        try {
-          await watchRoom.connect(defaultConfig);
-        } catch (connectError) {
-          console.error('[WatchRoom] Failed to connect:', connectError);
-        }
+        setIsEnabled(false);
       }
     };
 
