@@ -141,34 +141,43 @@ function LivePageClient() {
     },
   });
 
-  // EPG数据清洗函数 - 去除重叠的节目，保留时间较短的，只显示今日节目
+  // EPG数据清洗函数 - 去除重叠的节目，保留时间较短的，显示今日节目（18点后包含明天10点前的节目）
   const cleanEpgData = (programs: Array<{ start: string; end: string; title: string }>) => {
     if (!programs || programs.length === 0) return programs;
+
+    // 获取当前时间
+    const now = new Date();
+    const currentHour = now.getHours();
 
     // 获取今日日期（只考虑年月日，忽略时间）
     const today = new Date();
     const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const todayEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
 
-    // 首先过滤出今日的节目（包括跨天节目）
-    const todayPrograms = programs.filter(program => {
+    // 如果当前时间超过18点，扩展到明天10点
+    let endTime = todayEnd;
+    if (currentHour >= 18) {
+      // 明天10点
+      endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1, 10, 0, 0);
+    }
+
+    // 首先过滤出符合时间范围的节目（包括跨天节目）
+    const filteredPrograms = programs.filter(program => {
       const programStart = parseCustomTimeFormat(program.start);
       const programEnd = parseCustomTimeFormat(program.end);
 
-      // 获取节目的日期范围
-      const programStartDate = new Date(programStart.getFullYear(), programStart.getMonth(), programStart.getDate());
-      const programEndDate = new Date(programEnd.getFullYear(), programEnd.getMonth(), programEnd.getDate());
+      // 使用时间戳进行比较
+      const programStartTime = programStart.getTime();
+      const programEndTime = programEnd.getTime();
+      const todayStartTime = todayStart.getTime();
+      const endTimeValue = endTime.getTime();
 
-      // 如果节目的开始时间或结束时间在今天，或者节目跨越今天，都算作今天的节目
-      return (
-        (programStartDate >= todayStart && programStartDate < todayEnd) || // 开始时间在今天
-        (programEndDate >= todayStart && programEndDate < todayEnd) || // 结束时间在今天
-        (programStartDate < todayStart && programEndDate >= todayEnd) // 节目跨越今天（跨天节目）
-      );
+      // 节目的开始时间在范围内，或者节目在范围内播放（开始时间早于范围开始，但结束时间在范围内）
+      return programStartTime < endTimeValue && programEndTime > todayStartTime;
     });
 
     // 按开始时间排序
-    const sortedPrograms = [...todayPrograms].sort((a, b) => {
+    const sortedPrograms = [...filteredPrograms].sort((a, b) => {
       const startA = parseCustomTimeFormat(a.start).getTime();
       const startB = parseCustomTimeFormat(b.start).getTime();
       return startA - startB;
