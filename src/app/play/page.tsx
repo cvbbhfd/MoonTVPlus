@@ -30,12 +30,11 @@ import {
   convertDanmakuFormat,
   getDanmakuById,
   getEpisodes,
-  loadDanmakuMemory,
   loadDanmakuSettings,
-  saveDanmakuMemory,
   saveDanmakuSettings,
   searchAnime,
   initDanmakuModule,
+  getDanmakuFromCache,
 } from '@/lib/danmaku/api';
 import type { DanmakuAnime, DanmakuSelection, DanmakuSettings } from '@/lib/danmaku/types';
 import { SearchResult, DanmakuFilterConfig, EpisodeFilterConfig } from '@/lib/types';
@@ -509,37 +508,193 @@ function PlayPageClient() {
   }, [currentEpisodeIndex]);
 
   // 监听剧集切换，自动加载对应的弹幕
-  const lastLoadedEpisodeIdRef = useRef<number | null>(null);
+  const lastLoadedEpisodeIndexForDanmakuRef = useRef<number | null>(null);
 
   useEffect(() => {
-    // 只有在有弹幕选择且有剧集列表时才自动切换
-    if (
-      currentDanmakuSelection &&
-      danmakuEpisodesList.length > 0 &&
-      currentEpisodeIndex < danmakuEpisodesList.length
-    ) {
-      const episode = danmakuEpisodesList[currentEpisodeIndex];
-      if (episode && episode.episodeId !== currentDanmakuSelection.episodeId) {
-        // 避免重复加载同一集的弹幕
-        if (lastLoadedEpisodeIdRef.current === episode.episodeId) {
-          console.log(`跳过重复加载弹幕: episodeId=${episode.episodeId}`);
-          return;
-        }
-
-        // 自动加载新集数的弹幕
-        const newSelection: DanmakuSelection = {
-          animeId: currentDanmakuSelection.animeId,
-          episodeId: episode.episodeId,
-          animeTitle: currentDanmakuSelection.animeTitle,
-          episodeTitle: episode.episodeTitle,
-        };
-        setCurrentDanmakuSelection(newSelection);
-        lastLoadedEpisodeIdRef.current = episode.episodeId;
-        loadDanmaku(episode.episodeId);
-        console.log(`自动切换弹幕到第 ${currentEpisodeIndex + 1} 集`);
-      }
+    // 检查集数是否有效且是否已改变
+    if (currentEpisodeIndex < 0 || !videoTitle) {
+      return;
     }
-  }, [currentEpisodeIndex]);
+
+    // 如果集数已经加载过，跳过
+    if (lastLoadedEpisodeIndexForDanmakuRef.current === currentEpisodeIndex) {
+      return;
+    }
+
+    // 标记当前集数已加载
+    lastLoadedEpisodeIndexForDanmakuRef.current = currentEpisodeIndex;
+
+    console.log(`[弹幕] 剧集切换到第 ${currentEpisodeIndex + 1} 集，自动加载弹幕`);
+
+    // 自动加载弹幕的逻辑
+    const loadDanmakuForCurrentEpisode = async () => {
+      const title = videoTitleRef.current;
+      if (!title) {
+        console.warn('[弹幕] 视频标题为空，无法加载弹幕');
+        return;
+      }
+
+      const episodeIndex = currentEpisodeIndexRef.current;
+      console.log(`[弹幕] 开始加载第 ${episodeIndex + 1} 集弹幕`);
+
+      // 先尝试从 IndexedDB 缓存加载
+      try {
+        const cachedComments = await getDanmakuFromCache(title, episodeIndex);
+        if (cachedComments && cachedComments.length > 0 && danmakuPluginRef.current) {
+          console.log(`[弹幕] 使用缓存: title="${title}", episodeIndex=${episodeIndex}, 数量=${cachedComments.length}`);
+
+          setDanmakuLoading(true);
+
+          // 转换弹幕格式
+          let danmakuData = convertDanmakuFormat(cachedComments);
+
+          // 手动应用过滤规则
+          const filterConfig = danmakuFilterConfigRef.current;
+          if (filterConfig && filterConfig.rules.length > 0) {
+            const originalCount = danmakuData.length;
+            danmakuData = danmakuData.filter((danmu) => {
+              for (const rule of filterConfig.rules) {
+                if (!rule.enabled) continue;
+                try {
+                  if (rule.type === 'normal') {
+                    if (danmu.text.includes(rule.keyword)) {
+                      return false;
+                    }
+                  } else if (rule.type === 'regex') {
+                    if (new RegExp(rule.keyword).test(danmu.text)) {
+                      return false;
+                    }
+                  }
+                } catch (e) {
+                  console.error('弹幕过滤规则错误:', e);
+                }
+              }
+              return true;
+            });
+            const filteredCount = originalCount - danmakuData.length;
+            if (filteredCount > 0) {
+              console.log(`弹幕过滤: 原始 ${originalCount} 条，过滤 ${filteredCount} 条，剩余 ${danmakuData.length} 条`);
+            }
+          }
+
+          // 加载弹幕到插件
+          const currentSettings = danmakuSettingsRef.current;
+          danmakuPluginRef.current.config({
+            danmuku: danmakuData,
+            speed: currentSettings.speed,
+            opacity: currentSettings.opacity,
+            fontSize: currentSettings.fontSize,
+            margin: [currentSettings.marginTop, currentSettings.marginBottom],
+            synchronousPlayback: currentSettings.synchronousPlayback,
+          });
+          danmakuPluginRef.current.load();
+
+          // 根据设置显示或隐藏弹幕
+          if (currentSettings.enabled) {
+            danmakuPluginRef.current.show();
+          } else {
+            danmakuPluginRef.current.hide();
+          }
+
+          setDanmakuCount(danmakuData.length);
+          console.log(`[弹幕] 缓存加载成功，共 ${danmakuData.length} 条`);
+
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          setDanmakuLoading(false);
+
+          return; // 使用缓存成功，直接返回
+        }
+      } catch (error) {
+        console.error('[弹幕] 读取缓存失败:', error);
+      }
+
+      // 没有缓存，执行自动搜索弹幕
+      console.log(`[弹幕] 第 ${episodeIndex + 1} 集缓存未命中，开始搜索`);
+      setDanmakuLoading(true);
+
+      try {
+        const searchResult = await searchAnime(title);
+
+        if (searchResult.success && searchResult.animes.length > 0) {
+          // 应用智能过滤：优先匹配年份和标题
+          const videoYear = detailRef.current?.year;
+          const filteredAnimes = filterDanmakuSources(
+            searchResult.animes,
+            title,
+            videoYear
+          );
+
+          // 如果有多个匹配结果，让用户选择
+          if (filteredAnimes.length > 1) {
+            console.log(`找到 ${filteredAnimes.length} 个弹幕源，等待用户选择`);
+            setDanmakuMatches(filteredAnimes);
+            setCurrentSearchKeyword(title);
+            setShowDanmakuSourceSelector(true);
+            setDanmakuLoading(false);
+            if (artPlayerRef.current) {
+              artPlayerRef.current.notice.show = `找到 ${filteredAnimes.length} 个弹幕源，请选择`;
+            }
+            return;
+          }
+
+          // 只有一个结果，直接使用
+          const anime = filteredAnimes[0];
+
+          // 获取剧集列表
+          const episodesResult = await getEpisodes(anime.animeId);
+
+          if (
+            episodesResult.success &&
+            episodesResult.bangumi.episodes.length > 0
+          ) {
+            // 根据当前集数选择对应的弹幕
+            const currentEp = currentEpisodeIndexRef.current;
+            const videoEpTitle = detailRef.current?.episodes_titles?.[currentEp];
+            const episode = matchDanmakuEpisode(currentEp, episodesResult.bangumi.episodes, videoEpTitle);
+
+            if (episode) {
+              const selection: DanmakuSelection = {
+                animeId: anime.animeId,
+                episodeId: episode.episodeId,
+                animeTitle: anime.animeTitle,
+                episodeTitle: episode.episodeTitle,
+              };
+
+              // 设置选择记录
+              setCurrentDanmakuSelection(selection);
+
+              // 加载弹幕
+              await loadDanmaku(episode.episodeId);
+
+              // 设置剧集列表
+              setDanmakuEpisodesList(episodesResult.bangumi.episodes);
+
+              console.log('自动搜索弹幕成功:', selection);
+            }
+          } else {
+            console.warn('未找到剧集信息');
+            if (artPlayerRef.current) {
+              artPlayerRef.current.notice.show = '弹幕加载失败：未找到剧集信息';
+            }
+          }
+        } else {
+          console.warn('未找到匹配的弹幕');
+          if (artPlayerRef.current) {
+            artPlayerRef.current.notice.show = '未找到匹配的弹幕，可在弹幕选项卡手动搜索';
+          }
+        }
+      } catch (error) {
+        console.error('自动搜索弹幕失败:', error);
+        if (artPlayerRef.current) {
+          artPlayerRef.current.notice.show = '弹幕加载失败，请检查网络或稍后重试';
+        }
+      } finally {
+        setDanmakuLoading(false);
+      }
+    };
+
+    loadDanmakuForCurrentEpisode();
+  }, [currentEpisodeIndex, videoTitle]);
 
   // 获取豆瓣评分数据
   useEffect(() => {
@@ -2613,8 +2768,13 @@ function PlayPageClient() {
       });
       danmakuPluginRef.current.load();
 
-      // 获取弹幕数据
-      const comments = await getDanmakuById(episodeId);
+      // 获取弹幕数据（使用 title + episodeIndex 缓存）
+      const title = videoTitleRef.current;
+      const episodeIndex = currentEpisodeIndex;
+
+      console.log(`[弹幕加载] episodeId=${episodeId}, title="${title}", episodeIndex=${episodeIndex}`);
+
+      const comments = await getDanmakuById(episodeId, title, episodeIndex);
 
       if (comments.length === 0) {
         console.warn('未获取到弹幕数据');
@@ -2705,16 +2865,6 @@ function PlayPageClient() {
   const handleDanmakuSelect = async (selection: DanmakuSelection) => {
     setCurrentDanmakuSelection(selection);
 
-    // 保存选择记忆（包含搜索关键词）
-    saveDanmakuMemory(
-      videoTitleRef.current,
-      selection.animeId,
-      selection.episodeId,
-      selection.animeTitle,
-      selection.episodeTitle,
-      selection.searchKeyword // 保存用户使用的搜索关键词
-    );
-
     // 获取该动漫的所有剧集列表
     try {
       const episodesResult = await getEpisodes(selection.animeId);
@@ -2745,9 +2895,6 @@ function PlayPageClient() {
         episodesResult.success &&
         episodesResult.bangumi.episodes.length > 0
       ) {
-        // 保存剧集列表
-        setDanmakuEpisodesList(episodesResult.bangumi.episodes);
-
         // 根据当前集数选择对应的弹幕
         const currentEp = currentEpisodeIndexRef.current;
         const videoEpTitle = detailRef.current?.episodes_titles?.[currentEp];
@@ -2761,20 +2908,14 @@ function PlayPageClient() {
             episodeTitle: episode.episodeTitle,
           };
 
+          // 先设置选择记录
           setCurrentDanmakuSelection(selection);
-
-          // 保存选择记忆（使用当前搜索关键词）
-          saveDanmakuMemory(
-            title,
-            selection.animeId,
-            selection.episodeId,
-            selection.animeTitle,
-            selection.episodeTitle,
-            currentSearchKeyword || undefined // 使用保存的搜索关键词
-          );
 
           // 加载弹幕
           await loadDanmaku(episode.episodeId);
+
+          // 设置剧集列表
+          setDanmakuEpisodesList(episodesResult.bangumi.episodes);
 
           console.log('用户选择弹幕源:', selection);
         }
@@ -2845,99 +2986,92 @@ function PlayPageClient() {
       return;
     }
 
-    console.log('[弹幕] 开始自动搜索 - 视频标题:', title);
+    const currentEpisodeIndex = currentEpisodeIndexRef.current;
+    console.log('[弹幕] 开始加载弹幕 - 视频标题:', title, '集数:', currentEpisodeIndex);
 
-    // 检查是否有记忆
-    const memory = loadDanmakuMemory(title);
-    if (memory) {
-      console.log('[弹幕] 找到缓存 - 视频:', title, '→ 弹幕源:', memory.animeTitle);
+    // 先尝试从 IndexedDB 缓存加载
+    try {
+      const cachedComments = await getDanmakuFromCache(title, currentEpisodeIndex);
+      if (cachedComments && cachedComments.length > 0) {
+        console.log(`[弹幕] 使用缓存: title="${title}", episodeIndex=${currentEpisodeIndex}, 数量=${cachedComments.length}`);
 
-      // 获取该动漫的所有剧集列表
-      try {
-        const episodesResult = await getEpisodes(memory.animeId);
-        if (episodesResult.success && episodesResult.bangumi.episodes.length > 0) {
-          setDanmakuEpisodesList(episodesResult.bangumi.episodes);
+        // 直接加载缓存的弹幕，不需要调用 API
+        if (!danmakuPluginRef.current) {
+          console.warn('弹幕插件未初始化');
+          return;
+        }
 
-          // 根据当前集数选择对应的弹幕
-          const currentEp = currentEpisodeIndexRef.current;
-          const videoEpTitle = detailRef.current?.episodes_titles?.[currentEp];
-          const episode = matchDanmakuEpisode(currentEp, episodesResult.bangumi.episodes, videoEpTitle);
+        setDanmakuLoading(true);
 
-          if (episode) {
-            const selection: DanmakuSelection = {
-              animeId: memory.animeId,
-              episodeId: episode.episodeId,
-              animeTitle: memory.animeTitle,
-              episodeTitle: episode.episodeTitle,
-            };
+        // 转换弹幕格式
+        let danmakuData = convertDanmakuFormat(cachedComments);
 
-            setCurrentDanmakuSelection(selection);
-
-            // 更新选择记忆（保留原搜索词）
-            saveDanmakuMemory(
-              title,
-              selection.animeId,
-              selection.episodeId,
-              selection.animeTitle,
-              selection.episodeTitle,
-              memory.searchKeyword // 保留原有的搜索关键词
-            );
-
-            console.log('[弹幕] 使用缓存成功，跳过搜索');
-            lastLoadedEpisodeIdRef.current = episode.episodeId;
-            await loadDanmaku(episode.episodeId);
-            return; // 成功使用缓存，直接返回
-          } else {
-            console.warn('[弹幕] 缓存中没有找到匹配的剧集');
+        // 手动应用过滤规则
+        const filterConfig = danmakuFilterConfigRef.current;
+        if (filterConfig && filterConfig.rules.length > 0) {
+          const originalCount = danmakuData.length;
+          danmakuData = danmakuData.filter((danmu) => {
+            for (const rule of filterConfig.rules) {
+              if (!rule.enabled) continue;
+              try {
+                if (rule.type === 'normal') {
+                  if (danmu.text.includes(rule.keyword)) {
+                    return false;
+                  }
+                } else if (rule.type === 'regex') {
+                  if (new RegExp(rule.keyword).test(danmu.text)) {
+                    return false;
+                  }
+                }
+              } catch (e) {
+                console.error('弹幕过滤规则错误:', e);
+              }
+            }
+            return true;
+          });
+          const filteredCount = originalCount - danmakuData.length;
+          if (filteredCount > 0) {
+            console.log(`弹幕过滤: 原始 ${originalCount} 条，过滤 ${filteredCount} 条，剩余 ${danmakuData.length} 条`);
           }
+        }
+
+        // 加载弹幕到插件
+        const currentSettings = danmakuSettingsRef.current;
+        danmakuPluginRef.current.config({
+          danmuku: danmakuData,
+          speed: currentSettings.speed,
+          opacity: currentSettings.opacity,
+          fontSize: currentSettings.fontSize,
+          margin: [currentSettings.marginTop, currentSettings.marginBottom],
+          synchronousPlayback: currentSettings.synchronousPlayback,
+        });
+        danmakuPluginRef.current.load();
+
+        // 根据设置显示或隐藏弹幕
+        if (currentSettings.enabled) {
+          danmakuPluginRef.current.show();
         } else {
-          console.warn('[弹幕] 获取剧集列表失败或列表为空');
+          danmakuPluginRef.current.hide();
         }
 
-        // 如果使用记忆加载失败（没有找到对应的剧集），清除该记忆
-        console.warn('[弹幕] 缓存失效，清除缓存');
-        if (typeof window !== 'undefined') {
-          try {
-            const memoriesJson = localStorage.getItem('danmaku_memories');
-            if (memoriesJson) {
-              const memories = JSON.parse(memoriesJson);
-              delete memories[title];
-              localStorage.setItem('danmaku_memories', JSON.stringify(memories));
-              console.log('[弹幕] 已清除失效的缓存');
-            }
-          } catch (e) {
-            console.error('[弹幕] 清除缓存失败:', e);
-          }
-        }
-      } catch (error) {
-        console.error('[弹幕] 使用缓存加载失败:', error);
-        // 清除失效的记忆
-        if (typeof window !== 'undefined') {
-          try {
-            const memoriesJson = localStorage.getItem('danmaku_memories');
-            if (memoriesJson) {
-              const memories = JSON.parse(memoriesJson);
-              delete memories[title];
-              localStorage.setItem('danmaku_memories', JSON.stringify(memories));
-              console.log('[弹幕] 已清除失效的缓存');
-            }
-          } catch (e) {
-            console.error('[弹幕] 清除缓存失败:', e);
-          }
-        }
+        setDanmakuCount(danmakuData.length);
+        console.log(`[弹幕] 缓存加载成功，共 ${danmakuData.length} 条`);
+
+        // 延迟一下让用户看到弹幕数量
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        setDanmakuLoading(false);
+
+        return; // 使用缓存成功，直接返回
       }
-      // 缓存失效，降级到搜索流程
-      console.log('[弹幕] 缓存已失效，降级到搜索流程');
-      if (artPlayerRef.current) {
-        artPlayerRef.current.notice.show = '缓存的弹幕源失效，正在重新搜索...';
-      }
-      // 注意：这里故意不return，继续执行下面的搜索流程
+    } catch (error) {
+      console.error('[弹幕] 读取缓存失败:', error);
     }
 
-    // 没有缓存或缓存失效，执行自动搜索弹幕
+    // 没有缓存，执行自动搜索弹幕
+    console.log('[弹幕] 缓存未命中，开始搜索');
     setDanmakuLoading(true);
 
-    // 使用视频标题作为搜索关键词（缓存失效或不存在时）
+    // 使用视频标题作为搜索关键词
     const searchKeyword = title;
     console.log('[弹幕] 搜索关键词:', searchKeyword, '(使用视频标题)');
 
@@ -2976,9 +3110,6 @@ function PlayPageClient() {
           episodesResult.success &&
           episodesResult.bangumi.episodes.length > 0
         ) {
-          // 保存剧集列表
-          setDanmakuEpisodesList(episodesResult.bangumi.episodes);
-
           // 根据当前集数选择对应的弹幕
           const currentEp = currentEpisodeIndexRef.current;
           const videoEpTitle = detailRef.current?.episodes_titles?.[currentEp];
@@ -2992,21 +3123,14 @@ function PlayPageClient() {
               episodeTitle: episode.episodeTitle,
             };
 
+            // 先设置选择记录
             setCurrentDanmakuSelection(selection);
 
-            // 保存选择记忆（保存搜索关键词）
-            saveDanmakuMemory(
-              title,
-              selection.animeId,
-              selection.episodeId,
-              selection.animeTitle,
-              selection.episodeTitle,
-              searchKeyword // 保存实际使用的搜索关键词
-            );
-
             // 加载弹幕
-            lastLoadedEpisodeIdRef.current = episode.episodeId;
             await loadDanmaku(episode.episodeId);
+
+            // 设置剧集列表
+            setDanmakuEpisodesList(episodesResult.bangumi.episodes);
 
             console.log('自动搜索弹幕成功:', selection);
           }
